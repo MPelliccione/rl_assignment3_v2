@@ -171,10 +171,10 @@ class Policy(nn.Module):
         kl = (old_probs * (torch.log(old_probs + 1e-8) - torch.log(probs + 1e-8))).sum(dim=-1).mean()
         
         def fvp(v):
-            kl_grad = torch.autograd.grad(kl, policy_params, create_graph=True)
+            kl_grad = torch.autograd.grad(kl, policy_params, create_graph=True, retain_graph=True)
             flat_kl_grad = torch.cat([g.view(-1) for g in kl_grad])
             kl_v = (flat_kl_grad * v).sum()
-            kl_grad_grad = torch.autograd.grad(kl_v, policy_params)
+            kl_grad_grad = torch.autograd.grad(kl_v, policy_params, retain_graph=True)
             return torch.cat([g.contiguous().view(-1) for g in kl_grad_grad]) + self.damping * v
         
         step_dir = self._conjugate_gradient(fvp, flat_grad)
