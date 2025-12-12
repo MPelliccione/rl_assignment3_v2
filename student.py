@@ -7,7 +7,7 @@ import numpy as np
 class Policy(nn.Module):
     continuous = False # you can change this
 
-    def __init__(self, device=torch.device('cuda')):
+    def __init__(self, device=torch.device('cpu')):
         super(Policy, self).__init__()
         self.device = device
 
