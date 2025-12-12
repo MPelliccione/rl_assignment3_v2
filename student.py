@@ -16,7 +16,7 @@ class Policy(nn.Module):
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
         
-        self.fc1 = nn.Linear(64 * 7 * 7, 512)
+        self.fc1 = nn.Linear(64 * 8 * 8, 512)
         # Policy head (5 discrete actions for CarRacing)
         self.policy_head = nn.Linear(512, 5)
 
