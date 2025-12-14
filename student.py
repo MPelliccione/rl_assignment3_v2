@@ -9,6 +9,9 @@ class Policy(nn.Module):
 
     def __init__(self, device=torch.device('cpu')):
         super(Policy, self).__init__()
+        # Auto-select GPU if available
+        if device == torch.device('cpu') and torch.cuda.is_available():
+            device = torch.device('cuda')
         self.device = device
 
         # CNN for processing 96x96x3 images
@@ -34,7 +37,7 @@ class Policy(nn.Module):
         self.last_action = None
         
         # Move to device
-        self.to(device)
+        self.to(self.device)
 
     def forward(self, x):
         if x.dim() == 3:
