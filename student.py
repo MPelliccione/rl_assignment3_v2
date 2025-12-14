@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 
 class Policy(nn.Module):
-    continuous = False # you can change this
+    continuous = False
 
     def __init__(self, device=torch.device('cpu')):
         super(Policy, self).__init__()
@@ -63,6 +63,12 @@ class Policy(nn.Module):
     def get_action(self):
         return self.last_action
 
+    def _get_policy_params(self):
+        """Get all parameters that affect the policy (CNN + policy head)"""
+        return list(self.conv1.parameters()) + list(self.conv2.parameters()) + \
+               list(self.conv3.parameters()) + list(self.fc1.parameters()) + \
+               list(self.policy_head.parameters())
+
     def train(self):
         # Separate optimizer for value function only
         value_optimizer = torch.optim.Adam(self.value_head.parameters(), lr=self.value_lr)
@@ -70,7 +76,7 @@ class Policy(nn.Module):
         env = gym.make('CarRacing-v2', continuous=False)
         
         num_iterations = 500
-        steps_per_iter = 4096  # Increased for more data
+        steps_per_iter = 4096
         value_epochs = 10
         
         best_reward = -float('inf')
@@ -80,9 +86,6 @@ class Policy(nn.Module):
             state, _ = env.reset()
             episode_reward = 0
             episode_rewards = []
-            
-            # Set to eval mode during collection (for batch norm if any)
-            self.eval()
             
             for _ in range(steps_per_iter):
                 with torch.no_grad():
@@ -125,12 +128,11 @@ class Policy(nn.Module):
             
             advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
             
-            # TRPO policy update (updates ALL policy parameters including CNN)
+            # TRPO policy update
             self._trpo_update(states_t, actions_t, advantages_t, old_log_probs_t)
             
             # Update value function
             for _ in range(value_epochs):
-                # Process in mini-batches to avoid memory issues
                 batch_size = 256
                 indices = np.random.permutation(len(states))
                 for start in range(0, len(states), batch_size):
@@ -178,10 +180,8 @@ class Policy(nn.Module):
         return advantages, returns
     
     def _trpo_update(self, states, actions, advantages, old_log_probs):
-        # Get all policy parameters (including CNN)
         policy_params = self._get_policy_params()
         
-        # Compute policy loss and gradients
         features = self.forward(states)
         logits = self.policy_head(features)
         probs = F.softmax(logits, dim=-1)
@@ -193,11 +193,9 @@ class Policy(nn.Module):
         grads = torch.autograd.grad(policy_loss, policy_params, retain_graph=True)
         flat_grad = torch.cat([g.reshape(-1) for g in grads])
         
-        # Compute KL divergence
         old_probs = probs.detach()
         kl = (old_probs * (torch.log(old_probs + 1e-8) - torch.log(probs + 1e-8))).sum(dim=-1).mean()
         
-        # Fisher vector product
         def fvp(v):
             kl_grad = torch.autograd.grad(kl, policy_params, create_graph=True, retain_graph=True)
             flat_kl_grad = torch.cat([g.reshape(-1) for g in kl_grad])
@@ -205,15 +203,12 @@ class Policy(nn.Module):
             kl_grad_grad = torch.autograd.grad(kl_v, policy_params, retain_graph=True)
             return torch.cat([g.reshape(-1) for g in kl_grad_grad]) + self.damping * v
         
-        # Conjugate gradient to find step direction
         step_dir = self._conjugate_gradient(fvp, flat_grad)
         
-        # Compute step size
         shs = 0.5 * (step_dir * fvp(step_dir)).sum()
         lm = torch.sqrt(shs / self.max_kl + 1e-8)
         full_step = step_dir / (lm + 1e-8)
         
-        # Line search
         self._line_search(states, actions, advantages, old_log_probs, full_step, policy_params)
 
     def _conjugate_gradient(self, fvp, b, nsteps=10, residual_tol=1e-10):
@@ -236,10 +231,8 @@ class Policy(nn.Module):
 
     def _line_search(self, states, actions, advantages, old_log_probs, full_step, params, max_backtracks=10):
         with torch.no_grad():
-            # Save old parameters
             old_params = torch.cat([p.reshape(-1) for p in params])
             
-            # Compute old loss for comparison
             features = self.forward(states)
             logits = self.policy_head(features)
             probs = F.softmax(logits, dim=-1)
@@ -250,14 +243,12 @@ class Policy(nn.Module):
             for step_frac in [0.5 ** i for i in range(max_backtracks)]:
                 new_params = old_params - step_frac * full_step
                 
-                # Set new parameters
                 offset = 0
                 for p in params:
                     numel = p.numel()
                     p.copy_(new_params[offset:offset + numel].reshape(p.shape))
                     offset += numel
                 
-                # Compute new loss and KL
                 features = self.forward(states)
                 logits = self.policy_head(features)
                 probs = F.softmax(logits, dim=-1)
@@ -265,15 +256,12 @@ class Policy(nn.Module):
                 ratio = torch.exp(log_probs - old_log_probs)
                 new_loss = -(ratio * advantages).mean()
                 
-                # KL divergence
                 old_probs_batch = F.softmax(logits.detach(), dim=-1)
                 kl = (old_probs_batch * (torch.log(old_probs_batch + 1e-8) - torch.log(probs + 1e-8))).sum(dim=-1).mean()
                 
-                # Accept if KL constraint satisfied and loss improved
                 if kl < self.max_kl and new_loss < old_loss:
                     return
             
-            # Restore old parameters if line search fails
             offset = 0
             for p in params:
                 numel = p.numel()
