@@ -60,9 +60,10 @@ class Policy(nn.Module):
             features = self.forward(state)
             logits = self.policy_head(features)
             probs = F.softmax(logits, dim=-1)
-            self.last_action = torch.multinomial(probs, 1).item()
-        return 
-    
+            action = torch.multinomial(probs, 1).item()
+            self.last_action = action
+        return action  # <-- return the sampled action
+
     def get_action(self):
         return self.last_action
 
@@ -245,6 +246,11 @@ class Policy(nn.Module):
 
     def _line_search(self, states, actions, advantages, old_log_probs, full_step, params, max_backtracks=10):
         with torch.no_grad():
+            # cache old policy probabilities once
+            features_old = self.forward(states)
+            logits_old = self.policy_head(features_old)
+            old_probs_ref = F.softmax(logits_old, dim=-1).detach()
+
             old_params = torch.cat([p.reshape(-1) for p in params])
             
             features = self.forward(states)
@@ -270,7 +276,7 @@ class Policy(nn.Module):
                 ratio = torch.exp(log_probs - old_log_probs)
                 new_loss = -(ratio * advantages).mean()
                 
-                old_probs_batch = F.softmax(logits.detach(), dim=-1)
+                old_probs_batch = old_probs_ref  # use cached old policy
                 kl = (old_probs_batch * (torch.log(old_probs_batch + 1e-8) - torch.log(probs + 1e-8))).sum(dim=-1).mean()
                 
                 if kl < self.max_kl and new_loss < old_loss:
