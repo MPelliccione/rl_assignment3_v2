@@ -78,7 +78,7 @@ class Policy(nn.Module):
         
         env = gym.make('CarRacing-v2', continuous=False)
         
-        num_iterations = 500
+        num_iterations = 10
         steps_per_iter = 4096
         value_epochs = 10
         
