@@ -62,7 +62,7 @@ class Policy(nn.Module):
             probs = F.softmax(logits, dim=-1)
             action = torch.multinomial(probs, 1).item()
             self.last_action = action
-        return action  # <-- return the sampled action
+        return action
 
     def get_action(self):
         return self.last_action
@@ -79,7 +79,7 @@ class Policy(nn.Module):
         
         env = gym.make('CarRacing-v2', continuous=False)
         
-        num_iterations = 40
+        num_iterations = 300
         steps_per_iter = 4096
         value_epochs = 10
         
