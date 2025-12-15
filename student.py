@@ -120,6 +120,15 @@ class Policy(nn.Module):
                 else:
                     state = next_state
             
+            # Calculate value of the last state for bootstrapping
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).to(self.device)
+                features = self.forward(state_tensor)
+                last_value = self.value_head(features).item()
+            
+            # Append bootstrap value to values list
+            values.append(last_value)
+
             # Compute GAE
             advantages, returns = self._compute_gae(rewards, values, dones)
             
@@ -168,6 +177,8 @@ class Policy(nn.Module):
     def _compute_gae(self, rewards, values, dones):
         advantages = []
         gae = 0
+        
+        # Only
         values = values + [0]
         
         for t in reversed(range(len(rewards))):
