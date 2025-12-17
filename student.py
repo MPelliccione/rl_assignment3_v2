@@ -28,9 +28,9 @@ class Policy(nn.Module):
         
         # TRPO hyperparameters
         self.gamma = 0.99
-        self.lam = 0.9
+        self.lam = 0.95
         self.max_kl = 0.01
-        self.damping = 0.2
+        self.damping = 0.1
         self.value_lr = 1e-3
 
         # Move to device
@@ -100,7 +100,7 @@ class Policy(nn.Module):
                 actions.append(action.item())
                 values.append(value.item())
                 log_probs.append(log_prob.item())
-                old_probs.append(probs.cpu().numpy())
+                old_probs.append(probs.squeeze(0).cpu().numpy())  # drop batch dim
                 
                 next_state, reward, terminated, truncated, _ = env.step(action.item())
                 done = terminated or truncated
@@ -199,7 +199,7 @@ class Policy(nn.Module):
         features = self.forward(states)
         logits = self.policy_head(features)
         probs = F.softmax(logits, dim=-1)
-        log_probs = torch.log(probs.gather(1, actions.unsqueeze(1)).squeeze() + 1e-8)
+        log_probs = torch.log(probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)
         
         ratio = torch.exp(log_probs - old_log_probs)
         surrogate = (ratio * advantages).mean()  # We want to MAXIMIZE this
@@ -218,11 +218,13 @@ class Policy(nn.Module):
             kl_grad_grad = torch.autograd.grad(kl_v, policy_params, retain_graph=True)
             return torch.cat([g.reshape(-1) for g in kl_grad_grad]) + self.damping * v
         
-        step_dir = self._conjugate_gradient(fvp, flat_grad)
+        step_dir = self._conjugate_gradient(fvp, flat_grad, iters=15)
         
-        shs = 0.5 * (step_dir * fvp(step_dir)).sum()
-        lm = torch.sqrt(shs / self.max_kl + 1e-8)
-        full_step = step_dir / (lm + 1e-8)
+        shs = torch.dot(step_dir, fvp(step_dir))
+        if shs <= 0:
+            return
+        step_scale = torch.sqrt(2 * self.max_kl / (shs + 1e-8))
+        full_step = step_dir * step_scale
         
         old_params = self._flat_params(policy_params).detach().clone()
         old_surrogate = surrogate.item()
