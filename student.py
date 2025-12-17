@@ -177,11 +177,11 @@ class Policy(nn.Module):
         
         for t in reversed(range(len(rewards))):
             if dones[t]:
-                delta = rewards[t] - values[t]
-                gae = delta
+                next_value = 0  # Terminal state has no future value
             else:
-                delta = rewards[t] + self.gamma * values[t + 1] - values[t]
-                gae = delta + self.gamma * self.lam * gae
+                next_value = values[t + 1]
+            delta = rewards[t] + self.gamma * next_value - values[t]
+            gae = delta + self.gamma * self.lam * gae * (1 - dones[t])
             advantages.insert(0, gae)
         
         returns = [adv + val for adv, val in zip(advantages, values[:-1])]
@@ -202,10 +202,10 @@ class Policy(nn.Module):
         log_probs = torch.log(probs.gather(1, actions.unsqueeze(1)).squeeze() + 1e-8)
         
         ratio = torch.exp(log_probs - old_log_probs)
-        policy_loss = -(ratio * advantages).mean()
-        old_loss = policy_loss.item()
+        surrogate = (ratio * advantages).mean()  # We want to MAXIMIZE this
         
-        grads = torch.autograd.grad(policy_loss, policy_params, retain_graph=True)
+        # Gradient of surrogate (we want to ascend)
+        grads = torch.autograd.grad(surrogate, policy_params, retain_graph=True)
         flat_grad = torch.cat([g.reshape(-1) for g in grads])
         
         # Use the rollout (frozen) policy for KL
@@ -225,11 +225,12 @@ class Policy(nn.Module):
         full_step = step_dir / (lm + 1e-8)
         
         old_params = self._flat_params(policy_params).detach().clone()
+        old_surrogate = surrogate.item()
         self._line_search(states, actions, advantages, old_log_probs,
-                          full_step, policy_params, old_params, old_probs, old_loss)
+                          full_step, policy_params, old_params, old_probs, old_surrogate)
 
     def _line_search(self, states, actions, advantages, old_log_probs,
-                     full_step, params, old_params, old_probs, old_loss, max_backtracks=10):
+                     full_step, params, old_params, old_probs, old_surrogate, max_backtracks=10):
         # Start from old params
         self._set_flat_params(params, old_params)
         for step_frac in [0.5 ** i for i in range(max_backtracks)]:
@@ -239,9 +240,10 @@ class Policy(nn.Module):
                 new_probs = self.get_policy(states)
                 new_log_probs = torch.log(new_probs.gather(1, actions.unsqueeze(1)).squeeze() + 1e-8)
                 ratio = torch.exp(new_log_probs - old_log_probs)
-                new_loss = -(ratio * advantages).mean().item()
+                new_surrogate = (ratio * advantages).mean().item()  # Maximize this
                 kl = self._compute_kl(old_probs, new_probs).item()
-            if kl < self.max_kl and new_loss < old_loss:
+            # Accept if KL constraint satisfied AND surrogate improved
+            if kl < self.max_kl and new_surrogate > old_surrogate:
                 return  # accept
         # reject step
         self._set_flat_params(params, old_params)
