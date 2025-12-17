@@ -14,7 +14,7 @@ class Policy(nn.Module):
             device = torch.device('cuda')
         self.device = device
 
-        # CNN for processing 96x96x3 images
+        # CNN for processing images
         self.conv1 = nn.Conv2d(3, 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
@@ -28,10 +28,10 @@ class Policy(nn.Module):
         
         # TRPO hyperparameters
         self.gamma = 0.99
-        self.lam = 0.95
-        self.max_kl = 0.01
-        self.damping = 0.1
-        self.value_lr = 1e-3
+        self.lam = 0.9
+        self.max_kl = 0.005
+        self.damping = 0.2
+        self.value_lr = 3e-4
         
         # Store last action
         self.last_action = None
@@ -81,7 +81,7 @@ class Policy(nn.Module):
         
         num_iterations = 300
         steps_per_iter = 4096
-        value_epochs = 10
+        value_epochs = 20
         
         best_reward = -float('inf')
         
