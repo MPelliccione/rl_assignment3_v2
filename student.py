@@ -29,8 +29,8 @@ class Policy(nn.Module):
         # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.95
-        self.max_kl = 0.01
-        self.damping = 0.1
+        self.max_kl = 0.005  # tighter trust region for more stable steps
+        self.damping = 0.15  # slightly higher damping to stabilize FVP
         self.value_lr = 1e-3
 
         # Move to device
@@ -240,7 +240,7 @@ class Policy(nn.Module):
             self._set_flat_params(params, new_params)
             with torch.no_grad():
                 new_probs = self.get_policy(states)
-                new_log_probs = torch.log(new_probs.gather(1, actions.unsqueeze(1)).squeeze() + 1e-8)
+                new_log_probs = torch.log(new_probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)  # keep batch dim
                 ratio = torch.exp(new_log_probs - old_log_probs)
                 new_surrogate = (ratio * advantages).mean().item()  # Maximize this
                 kl = self._compute_kl(old_probs, new_probs).item()
