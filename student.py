@@ -29,9 +29,9 @@ class Policy(nn.Module):
         # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.9
-        self.max_kl = 0.005
+        self.max_kl = 0.01
         self.damping = 0.2
-        self.value_lr = 3e-4
+        self.value_lr = 1e-3
 
         # Move to device
         self.to(self.device)
