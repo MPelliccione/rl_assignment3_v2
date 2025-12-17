@@ -269,7 +269,10 @@ class Policy(nn.Module):
                 offset += numel
 
     def get_policy(self, states):
-        state_tensor = torch.FloatTensor(states).to(self.device)
+        if isinstance(states, torch.Tensor):
+            state_tensor = states.to(self.device)
+        else:
+            state_tensor = torch.FloatTensor(states).to(self.device)
         features = self.forward(state_tensor)
         logits = self.policy_head(features)
         return F.softmax(logits, dim=-1)
