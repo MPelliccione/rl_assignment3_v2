@@ -32,10 +32,7 @@ class Policy(nn.Module):
         self.max_kl = 0.005
         self.damping = 0.2
         self.value_lr = 3e-4
-        
-        # Store last action
-        self.last_action = None
-        
+
         # Move to device
         self.to(self.device)
 
@@ -61,11 +58,7 @@ class Policy(nn.Module):
             logits = self.policy_head(features)
             probs = F.softmax(logits, dim=-1)
             action = torch.multinomial(probs, 1).item()
-            self.last_action = action
         return action
-
-    def get_action(self):
-        return self.last_action
 
     def _get_policy_params(self):
         """Get all parameters that affect the policy (CNN + policy head)"""
@@ -90,6 +83,7 @@ class Policy(nn.Module):
             state, _ = env.reset()
             episode_reward = 0
             episode_rewards = []
+            old_probs = []
             
             for _ in range(steps_per_iter):
                 with torch.no_grad():
@@ -106,6 +100,7 @@ class Policy(nn.Module):
                 actions.append(action.item())
                 values.append(value.item())
                 log_probs.append(log_prob.item())
+                old_probs.append(probs.cpu().numpy())
                 
                 next_state, reward, terminated, truncated, _ = env.step(action.item())
                 done = terminated or truncated
@@ -138,11 +133,12 @@ class Policy(nn.Module):
             advantages_t = torch.FloatTensor(advantages).to(self.device)
             returns_t = torch.FloatTensor(returns).to(self.device)
             old_log_probs_t = torch.FloatTensor(log_probs).to(self.device)
+            old_probs_t = torch.FloatTensor(np.array(old_probs)).to(self.device)
             
             advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
             
             # TRPO policy update
-            self._trpo_update(states_t, actions_t, advantages_t, old_log_probs_t)
+            self._trpo_update(states_t, actions_t, advantages_t, old_log_probs_t, old_probs_t)
             
             # Update value function
             for _ in range(value_epochs):
@@ -179,9 +175,6 @@ class Policy(nn.Module):
         advantages = []
         gae = 0
         
-        # Only
-        values = values + [0]
-        
         for t in reversed(range(len(rewards))):
             if dones[t]:
                 delta = rewards[t] - values[t]
@@ -193,8 +186,14 @@ class Policy(nn.Module):
         
         returns = [adv + val for adv, val in zip(advantages, values[:-1])]
         return advantages, returns
-    
-    def _trpo_update(self, states, actions, advantages, old_log_probs):
+
+    def _compute_kl(self, old_probs, new_probs):
+        # KL(old || new): old_probs from rollout (no grad), new_probs current (with grad)
+        old_probs = torch.clamp(old_probs.detach(), 1e-8, 1.0)
+        new_probs = torch.clamp(new_probs, 1e-8, 1.0)
+        return (old_probs * (torch.log(old_probs) - torch.log(new_probs))).sum(dim=-1).mean()
+
+    def _trpo_update(self, states, actions, advantages, old_log_probs, old_probs):
         policy_params = self._get_policy_params()
         
         features = self.forward(states)
@@ -204,12 +203,13 @@ class Policy(nn.Module):
         
         ratio = torch.exp(log_probs - old_log_probs)
         policy_loss = -(ratio * advantages).mean()
+        old_loss = policy_loss.item()
         
         grads = torch.autograd.grad(policy_loss, policy_params, retain_graph=True)
         flat_grad = torch.cat([g.reshape(-1) for g in grads])
         
-        old_probs = probs.detach()
-        kl = (old_probs * (torch.log(old_probs + 1e-8) - torch.log(probs + 1e-8))).sum(dim=-1).mean()
+        # Use the rollout (frozen) policy for KL
+        kl = self._compute_kl(old_probs, probs)
         
         def fvp(v):
             kl_grad = torch.autograd.grad(kl, policy_params, create_graph=True, retain_graph=True)
@@ -224,69 +224,27 @@ class Policy(nn.Module):
         lm = torch.sqrt(shs / self.max_kl + 1e-8)
         full_step = step_dir / (lm + 1e-8)
         
-        self._line_search(states, actions, advantages, old_log_probs, full_step, policy_params)
+        old_params = self._flat_params(policy_params).detach().clone()
+        self._line_search(states, actions, advantages, old_log_probs,
+                          full_step, policy_params, old_params, old_probs, old_loss)
 
-    def _conjugate_gradient(self, fvp, b, nsteps=10, residual_tol=1e-10):
-        x = torch.zeros_like(b)
-        r = b.clone()
-        p = b.clone()
-        rdotr = torch.dot(r, r)
-        
-        for _ in range(nsteps):
-            Ap = fvp(p)
-            alpha = rdotr / (torch.dot(p, Ap) + 1e-8)
-            x += alpha * p
-            r -= alpha * Ap
-            new_rdotr = torch.dot(r, r)
-            if new_rdotr < residual_tol:
-                break
-            p = r + (new_rdotr / rdotr) * p
-            rdotr = new_rdotr
-        return x
-
-    def _line_search(self, states, actions, advantages, old_log_probs, full_step, params, max_backtracks=10):
-        with torch.no_grad():
-            # cache old policy probabilities once
-            features_old = self.forward(states)
-            logits_old = self.policy_head(features_old)
-            old_probs_ref = F.softmax(logits_old, dim=-1).detach()
-
-            old_params = torch.cat([p.reshape(-1) for p in params])
-            
-            features = self.forward(states)
-            logits = self.policy_head(features)
-            probs = F.softmax(logits, dim=-1)
-            log_probs = torch.log(probs.gather(1, actions.unsqueeze(1)).squeeze() + 1e-8)
-            ratio = torch.exp(log_probs - old_log_probs)
-            old_loss = -(ratio * advantages).mean()
-            
-            for step_frac in [0.5 ** i for i in range(max_backtracks)]:
-                new_params = old_params - step_frac * full_step
-                
-                offset = 0
-                for p in params:
-                    numel = p.numel()
-                    p.copy_(new_params[offset:offset + numel].reshape(p.shape))
-                    offset += numel
-                
-                features = self.forward(states)
-                logits = self.policy_head(features)
-                probs = F.softmax(logits, dim=-1)
-                log_probs = torch.log(probs.gather(1, actions.unsqueeze(1)).squeeze() + 1e-8)
-                ratio = torch.exp(log_probs - old_log_probs)
-                new_loss = -(ratio * advantages).mean()
-                
-                old_probs_batch = old_probs_ref  # use cached old policy
-                kl = (old_probs_batch * (torch.log(old_probs_batch + 1e-8) - torch.log(probs + 1e-8))).sum(dim=-1).mean()
-                
-                if kl < self.max_kl and new_loss < old_loss:
-                    return
-            
-            offset = 0
-            for p in params:
-                numel = p.numel()
-                p.copy_(old_params[offset:offset + numel].reshape(p.shape))
-                offset += numel
+    def _line_search(self, states, actions, advantages, old_log_probs,
+                     full_step, params, old_params, old_probs, old_loss, max_backtracks=10):
+        # Start from old params
+        self._set_flat_params(params, old_params)
+        for step_frac in [0.5 ** i for i in range(max_backtracks)]:
+            new_params = old_params + step_frac * full_step
+            self._set_flat_params(params, new_params)
+            with torch.no_grad():
+                new_probs = self.get_policy(states)
+                new_log_probs = torch.log(new_probs.gather(1, actions.unsqueeze(1)).squeeze() + 1e-8)
+                ratio = torch.exp(new_log_probs - old_log_probs)
+                new_loss = -(ratio * advantages).mean().item()
+                kl = self._compute_kl(old_probs, new_probs).item()
+            if kl < self.max_kl and new_loss < old_loss:
+                return  # accept
+        # reject step
+        self._set_flat_params(params, old_params)
 
     def save(self):
         torch.save(self.state_dict(), 'model.pt')
@@ -298,3 +256,37 @@ class Policy(nn.Module):
         ret = super().to(device)
         ret.device = device
         return ret
+    
+    def _flat_params(self, params):
+        return torch.cat([p.reshape(-1) for p in params])
+
+    def _set_flat_params(self, params, flat):
+        offset = 0
+        with torch.no_grad():
+            for p in params:
+                numel = p.numel()
+                p.data.copy_(flat[offset:offset+numel].reshape(p.shape))
+                offset += numel
+
+    def get_policy(self, states):
+        state_tensor = torch.FloatTensor(states).to(self.device)
+        features = self.forward(state_tensor)
+        logits = self.policy_head(features)
+        return F.softmax(logits, dim=-1)
+    
+    def _conjugate_gradient(self, fvp, b, iters=10, tol=1e-10):
+        x = torch.zeros_like(b)
+        r = b.clone()
+        p = b.clone()
+        rdotr = torch.dot(r, r)
+        for _ in range(iters):
+            Ap = fvp(p)
+            alpha = rdotr / (torch.dot(p, Ap) + 1e-8)
+            x += alpha * p
+            r -= alpha * Ap
+            new_rdotr = torch.dot(r, r)
+            if new_rdotr < tol:
+                break
+            p = r + (new_rdotr / (rdotr + 1e-8)) * p
+            rdotr = new_rdotr
+        return x
