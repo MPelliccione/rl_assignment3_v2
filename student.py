@@ -29,7 +29,7 @@ class Policy(nn.Module):
         # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.95
-        self.max_kl = 0.005  # tighter trust region for more stable steps
+        self.max_kl = 0.01  
         self.damping = 0.15  # slightly higher damping to stabilize FVP
         self.value_lr = 1e-3
 
