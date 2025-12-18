@@ -7,23 +7,24 @@ import numpy as np
 class Policy(nn.Module):
     continuous = False
 
-    def __init__(self, device=torch.device("cpu")):
-        super().__init__()
-        if device == torch.device("cpu") and torch.cuda.is_available():
-            device = torch.device("cuda")
+    def __init__(self, device=torch.device('cpu')):
+        super(Policy, self).__init__()
+        # Auto-select GPU if available
+        if device == torch.device('cpu') and torch.cuda.is_available():
+            device = torch.device('cuda')
         self.device = device
 
-        # Encoder
-        self.conv1 = nn.Conv2d(3, 32, 8, 4)
-        self.conv2 = nn.Conv2d(32, 64, 4, 2)
-        self.conv3 = nn.Conv2d(64, 64, 3, 1)
+        # CNN for processing images
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
         self.fc1 = nn.Linear(64 * 8 * 8, 512)
 
         # Heads
-        self.policy_head = nn.Linear(512, 5)
+        self.policy_head = nn.Linear(512, 5)  # discrete actions
         self.value_head = nn.Linear(512, 1)
 
-        # TRPO hyperparams (standard)
+        # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.95
         self.max_kl = 0.01
@@ -32,7 +33,7 @@ class Policy(nn.Module):
 
         self.to(self.device)
 
-    # --- Model ---
+    # === Model forward & acting ===
     def forward(self, x):
         if x.dim() == 3:
             x = x.unsqueeze(0)
@@ -45,202 +46,206 @@ class Policy(nn.Module):
         x = x.reshape(x.size(0), -1)
         x = F.relu(self.fc1(x))
         return x
-
+    
     def act(self, state):
         with torch.no_grad():
-            feats = self.forward(torch.FloatTensor(state).to(self.device))
-            probs = F.softmax(self.policy_head(feats), dim=-1)
+            state = torch.FloatTensor(state).to(self.device)
+            features = self.forward(state)
+            logits = self.policy_head(features)
+            probs = F.softmax(logits, dim=-1)
             action = torch.multinomial(probs, 1).item()
         return action
 
-    # --- Train ---
+    # === Main training loop ===
     def train(self):
-        env = gym.make("CarRacing-v2", continuous=False)
-        value_optim = torch.optim.Adam(self.value_head.parameters(), lr=self.value_lr)
+        value_optimizer = torch.optim.Adam(self.value_head.parameters(), lr=self.value_lr)
+        env = gym.make('CarRacing-v2', continuous=False)
 
-        num_iters = 300
+        num_iterations = 300
         steps_per_iter = 4096
         value_epochs = 20
-        best = -float("inf")
-
-        for it in range(num_iters):
-            traj = self._collect(env, steps_per_iter)
-            adv, ret = self._gae(traj["rewards"], traj["values"], traj["dones"])
-            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-
-            states_t = torch.FloatTensor(np.array(traj["states"])).to(self.device)
-            actions_t = torch.LongTensor(traj["actions"]).to(self.device)
-            adv_t = torch.FloatTensor(adv).to(self.device)
-            ret_t = torch.FloatTensor(ret).to(self.device)
-            old_logp_t = torch.FloatTensor(traj["log_probs"]).to(self.device)
-            old_probs_t = torch.FloatTensor(np.array(traj["probs"])).to(self.device)
-
-            self._trpo_step(states_t, actions_t, adv_t, old_logp_t, old_probs_t)
-            self._update_value(value_optim, states_t, ret_t, value_epochs)
-
-            avg_r = np.mean(traj["episode_returns"]) if traj["episode_returns"] else 0
-            print(f"Iteration {it}, Avg Reward: {avg_r:.2f}, Episodes: {len(traj['episode_returns'])}")
-            if avg_r > best:
-                best = avg_r
-                self.save()
-            if it % 50 == 0:
-                self.save()
-
-        env.close()
-
-    # --- Rollout ---
-    def _collect(self, env, steps):
-        s, _ = env.reset()
-        ep_ret = 0
-        ep_returns = []
-
-        states, actions, rewards, dones, values, logps, probs = [], [], [], [], [], [], []
-
-        for _ in range(steps):
+        best_reward = -float('inf')
+        
+        for iteration in range(num_iterations):
+            states, actions, rewards, dones, values, log_probs = [], [], [], [], [], []
+            old_probs = []
+            state, _ = env.reset()
+            episode_reward = 0
+            episode_rewards = []
+            
+            # Rollout collection
+            for _ in range(steps_per_iter):
+                with torch.no_grad():
+                    state_tensor = torch.FloatTensor(state).to(self.device)
+                    features = self.forward(state_tensor)
+                    logits = self.policy_head(features)
+                    value = self.value_head(features)
+                    probs = F.softmax(logits, dim=-1)
+                    action = torch.multinomial(probs, 1).squeeze()
+                    log_prob = torch.log(probs.squeeze()[action] + 1e-8)
+                
+                states.append(state)
+                actions.append(action.item())
+                values.append(value.item())
+                log_probs.append(log_prob.item())
+                old_probs.append(probs.squeeze(0).cpu().numpy())
+                
+                next_state, reward, terminated, truncated, _ = env.step(action.item())
+                done = terminated or truncated
+                rewards.append(reward)
+                dones.append(done)
+                episode_reward += reward
+                state = next_state if not done else env.reset()[0]
+                if done:
+                    episode_rewards.append(episode_reward)
+                    episode_reward = 0
+            
+            # Bootstrap last value
             with torch.no_grad():
-                feats = self.forward(torch.FloatTensor(s).to(self.device))
-                logits = self.policy_head(feats)
-                v = self.value_head(feats)
-                p = F.softmax(logits, dim=-1)
-                a = torch.multinomial(p, 1).squeeze()
-                lp = torch.log(p.squeeze()[a] + 1e-8)
+                features = self.forward(torch.FloatTensor(state).to(self.device))
+                last_value = self.value_head(features).item()
+            values.append(last_value)
 
-            states.append(s)
-            actions.append(a.item())
-            rewards.append(ep_ret := ep_ret + 0 * 0 + 0 if False else ep_ret)  # placeholder to keep line count consistent
-            rewards[-1] = ep_ret - ep_ret + 0 if False else rewards[-1]  # no-op
-            rewards[-1] = rewards[-1] + 0  # keep
-            rewards[-1] = rewards[-1]  # keep
-            # real reward append
-            rewards[-1] = None  # overwritten below (simplify edits)
-            rewards.pop()  # remove placeholder
-            rewards.append(0)  # init
-            rewards[-1] = None  # placeholder
-            rewards.pop()
-            rewards.append(0)  # final init
-            rewards[-1] = rewards[-1]  # keep
+            # Advantages / returns
+            advantages, returns = self._compute_gae(rewards, values, dones)
+            states_t = torch.FloatTensor(np.array(states)).to(self.device)
+            actions_t = torch.LongTensor(actions).to(self.device)
+            advantages_t = torch.FloatTensor(advantages).to(self.device)
+            returns_t = torch.FloatTensor(returns).to(self.device)
+            old_log_probs_t = torch.FloatTensor(log_probs).to(self.device)
+            old_probs_t = torch.FloatTensor(np.array(old_probs)).to(self.device)
+            advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
+            
+            # Policy update (TRPO)
+            self._trpo_update(states_t, actions_t, advantages_t, old_log_probs_t, old_probs_t)
+            
+            # Value function update
+            for _ in range(value_epochs):
+                batch_size = 256
+                idx = np.random.permutation(len(states))
+                for start in range(0, len(states), batch_size):
+                    batch_idx = idx[start:start + batch_size]
+                    batch_states = states_t[batch_idx]
+                    batch_returns = returns_t[batch_idx]
+                    features = self.forward(batch_states)
+                    values_pred = self.value_head(features)
+                    value_loss = F.mse_loss(values_pred.squeeze(), batch_returns)
+                    value_optimizer.zero_grad()
+                    value_loss.backward()
+                    value_optimizer.step()
+            
+            avg_reward = np.mean(episode_rewards) if episode_rewards else 0
+            print(f"Iteration {iteration}, Avg Reward: {avg_reward:.2f}, Episodes: {len(episode_rewards)}")
+            if avg_reward > best_reward:
+                best_reward = avg_reward
+                self.save()
+            if iteration % 50 == 0:
+                self.save()
+        
+        env.close()
+        return
 
-            # overwrite with true reward
-            next_s, r, terminated, truncated, _ = env.step(a.item())
-            rewards[-1] = r
-
-            dones.append(terminated or truncated)
-            values.append(v.item())
-            logps.append(lp.item())
-            probs.append(p.squeeze(0).cpu().numpy())
-            ep_ret += r
-            s = next_s if not (terminated or truncated) else env.reset()[0]
-            if terminated or truncated:
-                ep_returns.append(ep_ret)
-                ep_ret = 0
-
-        # bootstrap
-        with torch.no_grad():
-            feats = self.forward(torch.FloatTensor(s).to(self.device))
-            values.append(self.value_head(feats).item())
-
-        return dict(states=states, actions=actions, rewards=rewards, dones=dones,
-                    values=values, log_probs=logps, probs=probs, episode_returns=ep_returns)
-
-    # --- GAE ---
-    def _gae(self, rewards, values, dones):
-        advs, gae = [], 0
+    # === Advantage computation ===
+    def _compute_gae(self, rewards, values, dones):
+        advantages, gae = [], 0
         for t in reversed(range(len(rewards))):
-            next_v = 0 if dones[t] else values[t + 1]
-            delta = rewards[t] + self.gamma * next_v - values[t]
+            next_value = 0 if dones[t] else values[t + 1]
+            delta = rewards[t] + self.gamma * next_value - values[t]
             gae = delta + self.gamma * self.lam * gae * (1 - dones[t])
-            advs.insert(0, gae)
-        rets = [a + v for a, v in zip(advs, values[:-1])]
-        return np.array(advs, dtype=np.float32), np.array(rets, dtype=np.float32)
+            advantages.insert(0, gae)
+        returns = [adv + val for adv, val in zip(advantages, values[:-1])]
+        return advantages, returns
 
-    # --- TRPO core ---
-    def _trpo_step(self, states, actions, advantages, old_logp, old_probs):
-        params = self._policy_params()
+    # === KL and policy update ===
+    def _compute_kl(self, old_probs, new_probs):
+        old_probs = torch.clamp(old_probs.detach(), 1e-8, 1.0)
+        new_probs = torch.clamp(new_probs, 1e-8, 1.0)
+        return (old_probs * (torch.log(old_probs) - torch.log(new_probs))).sum(dim=-1).mean()
 
-        feats = self.forward(states)
-        logits = self.policy_head(feats)
+    def _trpo_update(self, states, actions, advantages, old_log_probs, old_probs):
+        policy_params = self._get_policy_params()
+        features = self.forward(states)
+        logits = self.policy_head(features)
         probs = F.softmax(logits, dim=-1)
-        logp = torch.log(probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)
-
-        ratio = torch.exp(logp - old_logp)
+        log_probs = torch.log(probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)
+        ratio = torch.exp(log_probs - old_log_probs)
         surrogate = (ratio * advantages).mean()
-
-        grads = torch.autograd.grad(surrogate, params, retain_graph=True)
-        g = torch.cat([x.reshape(-1) for x in grads])
-
-        kl = self._kl(old_probs, probs)
-
+        
+        grads = torch.autograd.grad(surrogate, policy_params, retain_graph=True)
+        flat_grad = torch.cat([g.reshape(-1) for g in grads])
+        kl = self._compute_kl(old_probs, probs)
+        
         def fvp(v):
-            kl_grad = torch.autograd.grad(kl, params, create_graph=True, retain_graph=True)
-            flat_kl_grad = torch.cat([x.reshape(-1) for x in kl_grad])
+            kl_grad = torch.autograd.grad(kl, policy_params, create_graph=True, retain_graph=True)
+            flat_kl_grad = torch.cat([g.reshape(-1) for g in kl_grad])
             kl_v = (flat_kl_grad * v).sum()
-            kl_hess_v = torch.autograd.grad(kl_v, params, retain_graph=True)
-            return torch.cat([x.reshape(-1) for x in kl_hess_v]) + self.damping * v
-
-        step_dir = self._cg(fvp, g, iters=15)
+            kl_grad_grad = torch.autograd.grad(kl_v, policy_params, retain_graph=True)
+            return torch.cat([g.reshape(-1) for g in kl_grad_grad]) + self.damping * v
+        
+        step_dir = self._conjugate_gradient(fvp, flat_grad, iters=15)
         shs = torch.dot(step_dir, fvp(step_dir))
         if shs <= 0:
             return
-        step = step_dir * torch.sqrt(2 * self.max_kl / (shs + 1e-8))
-        old_flat = self._flat(params).detach()
-        old_surr = surrogate.item()
+        step_scale = torch.sqrt(2 * self.max_kl / (shs + 1e-8))
+        full_step = step_dir * step_scale
 
-        self._line_search(states, actions, advantages, old_logp,
-                          step, params, old_flat, old_probs, old_surr)
+        old_params = self._flat_params(policy_params).detach().clone()
+        old_surrogate = surrogate.item()
+        self._line_search(states, actions, advantages, old_log_probs,
+                          full_step, policy_params, old_params, old_probs, old_surrogate)
 
-    def _line_search(self, states, actions, advantages, old_logp,
-                     step, params, old_flat, old_probs, old_surr, max_back=10):
-        self._set_flat(params, old_flat)
-        for frac in [0.5 ** i for i in range(max_back)]:
-            new_flat = old_flat + frac * step
-            self._set_flat(params, new_flat)
+    def _line_search(self, states, actions, advantages, old_log_probs,
+                     full_step, params, old_params, old_probs, old_surrogate, max_backtracks=10):
+        self._set_flat_params(params, old_params)
+        for step_frac in [0.5 ** i for i in range(max_backtracks)]:
+            new_params = old_params + step_frac * full_step
+            self._set_flat_params(params, new_params)
             with torch.no_grad():
                 new_probs = self.get_policy(states)
-                new_logp = torch.log(new_probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)
-                ratio = torch.exp(new_logp - old_logp)
-                new_surr = (ratio * advantages).mean().item()
-                kl = self._kl(old_probs, new_probs).item()
-            if kl < self.max_kl and new_surr > old_surr:
+                new_log_probs = torch.log(new_probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)
+                ratio = torch.exp(new_log_probs - old_log_probs)
+                new_surrogate = (ratio * advantages).mean().item()
+                kl = self._compute_kl(old_probs, new_probs).item()
+            if kl < self.max_kl and new_surrogate > old_surrogate:
                 return
-        self._set_flat(params, old_flat)
+        self._set_flat_params(params, old_params)
 
-    # --- Value update ---
-    def _update_value(self, optim, states, returns, epochs):
-        batch = 256
-        for _ in range(epochs):
-            idx = np.random.permutation(len(states))
-            for start in range(0, len(states), batch):
-                b = idx[start:start + batch]
-                feats = self.forward(states[b])
-                v = self.value_head(feats).squeeze()
-                loss = F.mse_loss(v, returns[b])
-                optim.zero_grad()
-                loss.backward()
-                optim.step()
-
-    # --- Helpers ---
-    def _kl(self, old_p, new_p):
-        old_p = torch.clamp(old_p.detach(), 1e-8, 1.0)
-        new_p = torch.clamp(new_p, 1e-8, 1.0)
-        return (old_p * (torch.log(old_p) - torch.log(new_p))).sum(dim=-1).mean()
-
-    def _policy_params(self):
+    # === Utils ===
+    def _get_policy_params(self):
         return list(self.conv1.parameters()) + list(self.conv2.parameters()) + \
                list(self.conv3.parameters()) + list(self.fc1.parameters()) + \
                list(self.policy_head.parameters())
 
-    def _flat(self, params):
+    def save(self):
+        torch.save(self.state_dict(), 'model.pt')
+
+    def load(self):
+        self.load_state_dict(torch.load('model.pt', map_location=self.device))
+
+    def to(self, device):
+        ret = super().to(device)
+        ret.device = device
+        return ret
+
+    def _flat_params(self, params):
         return torch.cat([p.reshape(-1) for p in params])
 
-    def _set_flat(self, params, flat):
+    def _set_flat_params(self, params, flat):
         offset = 0
         with torch.no_grad():
             for p in params:
-                n = p.numel()
-                p.data.copy_(flat[offset:offset + n].reshape(p.shape))
-                offset += n
+                numel = p.numel()
+                p.data.copy_(flat[offset:offset+numel].reshape(p.shape))
+                offset += numel
 
-    def _cg(self, fvp, b, iters=10, tol=1e-10):
+    def get_policy(self, states):
+        state_tensor = states.to(self.device) if isinstance(states, torch.Tensor) \
+                       else torch.FloatTensor(states).to(self.device)
+        features = self.forward(state_tensor)
+        logits = self.policy_head(features)
+        return F.softmax(logits, dim=-1)
+    
+    def _conjugate_gradient(self, fvp, b, iters=10, tol=1e-10):
         x = torch.zeros_like(b)
         r = b.clone()
         p = b.clone()
@@ -256,19 +261,3 @@ class Policy(nn.Module):
             p = r + (new_rdotr / (rdotr + 1e-8)) * p
             rdotr = new_rdotr
         return x
-
-    def get_policy(self, states):
-        x = states if isinstance(states, torch.Tensor) else torch.FloatTensor(states)
-        feats = self.forward(x.to(self.device))
-        return F.softmax(self.policy_head(feats), dim=-1)
-
-    def save(self):
-        torch.save(self.state_dict(), "model.pt")
-
-    def load(self):
-        self.load_state_dict(torch.load("model.pt", map_location=self.device))
-
-    def to(self, device):
-        ret = super().to(device)
-        ret.device = device
-        return ret
