@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 
 class Policy(nn.Module):
-    continuous = False
+    continuous = True
 
     def __init__(self, device=torch.device('cpu')):
         super(Policy, self).__init__()
@@ -21,13 +21,14 @@ class Policy(nn.Module):
         self.fc1 = nn.Linear(64 * 8 * 8, 512)
 
         # Heads
-        self.policy_head = nn.Linear(512, 5)  # discrete actions
+        self.policy_mean = nn.Linear(512, 3)  # steer, gas, brake
+        self.log_std = nn.Parameter(torch.zeros(3))
         self.value_head = nn.Linear(512, 1)
 
         # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.95
-        self.max_kl = 0.01
+        self.delta = 0.01
         self.damping = 0.15
         self.value_lr = 1e-3
 
@@ -49,17 +50,21 @@ class Policy(nn.Module):
     
     def act(self, state):
         with torch.no_grad():
-            state = torch.FloatTensor(state).to(self.device)
-            features = self.forward(state)
-            logits = self.policy_head(features)
-            probs = F.softmax(logits, dim=-1)
-            action = torch.multinomial(probs, 1).item()
-        return action
+            feats = self.forward(torch.FloatTensor(state).to(self.device))
+            mean = self.policy_mean(feats)
+            std = torch.exp(self.log_std)
+            action = mean + std * torch.randn_like(mean)
+            action = torch.stack([
+                action[..., 0].clamp(-1, 1),  # steer
+                action[..., 1].clamp(0, 1),   # gas
+                action[..., 2].clamp(0, 1),   # brake
+            ], dim=-1).squeeze(0)
+        return action.cpu().numpy()
 
     # === Main training loop ===
     def train(self):
         value_optimizer = torch.optim.Adam(self.value_head.parameters(), lr=self.value_lr)
-        env = gym.make('CarRacing-v2', continuous=False)
+        env = gym.make('CarRacing-v2', continuous=True)
 
         num_iterations = 300
         steps_per_iter = 4096
@@ -157,10 +162,18 @@ class Policy(nn.Module):
         return advantages, returns
 
     # === KL and policy update ===
-    def _compute_kl(self, old_probs, new_probs):
-        old_probs = torch.clamp(old_probs.detach(), 1e-8, 1.0)
-        new_probs = torch.clamp(new_probs, 1e-8, 1.0)
-        return (old_probs * (torch.log(old_probs) - torch.log(new_probs))).sum(dim=-1).mean()
+    def _gaussian_log_prob(self, action, mean, log_std):
+        var = torch.exp(2 * log_std)
+        return -0.5 * (((action - mean) ** 2) / (var + 1e-8) + 2 * log_std + np.log(2 * np.pi)).sum(-1)
+
+    def _compute_kl(self, old_mean, old_log_std, new_mean, new_log_std):
+        old_var = torch.exp(2 * old_log_std)
+        new_var = torch.exp(2 * new_log_std)
+        return 0.5 * (
+            ((old_var + (old_mean - new_mean) ** 2) / (new_var + 1e-8)).sum(-1)
+            + 2 * (new_log_std - old_log_std).sum(-1)
+            - old_mean.size(-1)
+        ).mean()
 
     def _trpo_update(self, states, actions, advantages, old_log_probs, old_probs):
         policy_params = self._get_policy_params()
@@ -186,7 +199,7 @@ class Policy(nn.Module):
         shs = torch.dot(step_dir, fvp(step_dir))
         if shs <= 0:
             return
-        step_scale = torch.sqrt(2 * self.max_kl / (shs + 1e-8))
+        step_scale = torch.sqrt(2 * self.delta / (shs + 1e-8))
         full_step = step_dir * step_scale
 
         old_params = self._flat_params(policy_params).detach().clone()
@@ -206,7 +219,7 @@ class Policy(nn.Module):
                 ratio = torch.exp(new_log_probs - old_log_probs)
                 new_surrogate = (ratio * advantages).mean().item()
                 kl = self._compute_kl(old_probs, new_probs).item()
-            if kl < self.max_kl and new_surrogate > old_surrogate:
+            if kl < self.delta and new_surrogate > old_surrogate:
                 return
         self._set_flat_params(params, old_params)
 
