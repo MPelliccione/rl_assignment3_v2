@@ -73,7 +73,7 @@ class Policy(nn.Module):
         
         for iteration in range(num_iterations):
             states, actions, rewards, dones, values, log_probs = [], [], [], [], [], []
-            old_probs = []
+            old_means, old_log_stds = [], []
             state, _ = env.reset()
             episode_reward = 0
             episode_rewards = []
@@ -83,19 +83,26 @@ class Policy(nn.Module):
                 with torch.no_grad():
                     state_tensor = torch.FloatTensor(state).to(self.device)
                     features = self.forward(state_tensor)
-                    logits = self.policy_head(features)
-                    value = self.value_head(features)
-                    probs = F.softmax(logits, dim=-1)
-                    action = torch.multinomial(probs, 1).squeeze()
-                    log_prob = torch.log(probs.squeeze()[action] + 1e-8)
-                
+                    mean = self.policy_mean(features)
+                    log_std = self.log_std.expand_as(mean)
+                    std = torch.exp(log_std)
+                    action = mean + std * torch.randn_like(mean)
+                    # clip to env bounds
+                    action = torch.stack([
+                        action[..., 0].clamp(-1, 1),
+                        action[..., 1].clamp(0, 1),
+                        action[..., 2].clamp(0, 1),
+                    ], dim=-1)
+                    log_prob = self._gaussian_log_prob(action, mean, log_std)
+
+                actions.append(action.squeeze(0).cpu().numpy())
                 states.append(state)
-                actions.append(action.item())
-                values.append(value.item())
+                values.append(self.value_head(features).item())
                 log_probs.append(log_prob.item())
-                old_probs.append(probs.squeeze(0).cpu().numpy())
+                old_means.append(mean.squeeze(0).cpu().numpy())
+                old_log_stds.append(log_std.squeeze(0).cpu().numpy())
                 
-                next_state, reward, terminated, truncated, _ = env.step(action.item())
+                next_state, reward, terminated, truncated, _ = env.step(action.squeeze(0).cpu().numpy())
                 done = terminated or truncated
                 rewards.append(reward)
                 dones.append(done)
@@ -114,15 +121,16 @@ class Policy(nn.Module):
             # Advantages / returns
             advantages, returns = self._compute_gae(rewards, values, dones)
             states_t = torch.FloatTensor(np.array(states)).to(self.device)
-            actions_t = torch.LongTensor(actions).to(self.device)
+            actions_t = torch.FloatTensor(np.array(actions)).to(self.device)
             advantages_t = torch.FloatTensor(advantages).to(self.device)
             returns_t = torch.FloatTensor(returns).to(self.device)
             old_log_probs_t = torch.FloatTensor(log_probs).to(self.device)
-            old_probs_t = torch.FloatTensor(np.array(old_probs)).to(self.device)
+            old_means_t = torch.FloatTensor(np.array(old_means)).to(self.device)
+            old_log_stds_t = torch.FloatTensor(np.array(old_log_stds)).to(self.device)
             advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
             
             # Policy update (TRPO)
-            self._trpo_update(states_t, actions_t, advantages_t, old_log_probs_t, old_probs_t)
+            self._trpo_update(states_t, actions_t, advantages_t, old_log_probs_t, old_means_t, old_log_stds_t)
             
             # Value function update
             for _ in range(value_epochs):
@@ -162,31 +170,18 @@ class Policy(nn.Module):
         return advantages, returns
 
     # === KL and policy update ===
-    def _gaussian_log_prob(self, action, mean, log_std):
-        var = torch.exp(2 * log_std)
-        return -0.5 * (((action - mean) ** 2) / (var + 1e-8) + 2 * log_std + np.log(2 * np.pi)).sum(-1)
-
-    def _compute_kl(self, old_mean, old_log_std, new_mean, new_log_std):
-        old_var = torch.exp(2 * old_log_std)
-        new_var = torch.exp(2 * new_log_std)
-        return 0.5 * (
-            ((old_var + (old_mean - new_mean) ** 2) / (new_var + 1e-8)).sum(-1)
-            + 2 * (new_log_std - old_log_std).sum(-1)
-            - old_mean.size(-1)
-        ).mean()
-
-    def _trpo_update(self, states, actions, advantages, old_log_probs, old_probs):
+    def _trpo_update(self, states, actions, advantages, old_log_probs, old_means, old_log_stds):
         policy_params = self._get_policy_params()
         features = self.forward(states)
-        logits = self.policy_head(features)
-        probs = F.softmax(logits, dim=-1)
-        log_probs = torch.log(probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)
+        mean = self.policy_mean(features)
+        log_std = self.log_std.expand_as(mean)
+        log_probs = self._gaussian_log_prob(actions, mean, log_std)
         ratio = torch.exp(log_probs - old_log_probs)
         surrogate = (ratio * advantages).mean()
         
         grads = torch.autograd.grad(surrogate, policy_params, retain_graph=True)
         flat_grad = torch.cat([g.reshape(-1) for g in grads])
-        kl = self._compute_kl(old_probs, probs)
+        kl = self._compute_kl(old_means, old_log_stds, mean, log_std)
         
         def fvp(v):
             kl_grad = torch.autograd.grad(kl, policy_params, create_graph=True, retain_graph=True)
@@ -205,20 +200,22 @@ class Policy(nn.Module):
         old_params = self._flat_params(policy_params).detach().clone()
         old_surrogate = surrogate.item()
         self._line_search(states, actions, advantages, old_log_probs,
-                          full_step, policy_params, old_params, old_probs, old_surrogate)
+                          full_step, policy_params, old_params, old_means, old_log_stds, old_surrogate)
 
     def _line_search(self, states, actions, advantages, old_log_probs,
-                     full_step, params, old_params, old_probs, old_surrogate, max_backtracks=10):
+                     full_step, params, old_params, old_means, old_log_stds, old_surrogate, max_backtracks=10):
         self._set_flat_params(params, old_params)
         for step_frac in [0.5 ** i for i in range(max_backtracks)]:
             new_params = old_params + step_frac * full_step
             self._set_flat_params(params, new_params)
             with torch.no_grad():
-                new_probs = self.get_policy(states)
-                new_log_probs = torch.log(new_probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)
+                features = self.forward(states)
+                mean = self.policy_mean(features)
+                log_std = self.log_std.expand_as(mean)
+                new_log_probs = self._gaussian_log_prob(actions, mean, log_std)
                 ratio = torch.exp(new_log_probs - old_log_probs)
                 new_surrogate = (ratio * advantages).mean().item()
-                kl = self._compute_kl(old_probs, new_probs).item()
+                kl = self._compute_kl(old_means, old_log_stds, mean, log_std).item()
             if kl < self.delta and new_surrogate > old_surrogate:
                 return
         self._set_flat_params(params, old_params)
@@ -227,7 +224,7 @@ class Policy(nn.Module):
     def _get_policy_params(self):
         return list(self.conv1.parameters()) + list(self.conv2.parameters()) + \
                list(self.conv3.parameters()) + list(self.fc1.parameters()) + \
-               list(self.policy_head.parameters())
+               list(self.policy_mean.parameters()) + [self.log_std]
 
     def save(self):
         torch.save(self.state_dict(), 'model.pt')
@@ -255,8 +252,9 @@ class Policy(nn.Module):
         state_tensor = states.to(self.device) if isinstance(states, torch.Tensor) \
                        else torch.FloatTensor(states).to(self.device)
         features = self.forward(state_tensor)
-        logits = self.policy_head(features)
-        return F.softmax(logits, dim=-1)
+        mean = self.policy_mean(features)
+        log_std = self.log_std.expand_as(mean)
+        return mean, log_std
     
     def _conjugate_gradient(self, fvp, b, iters=10, tol=1e-10):
         x = torch.zeros_like(b)
