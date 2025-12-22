@@ -100,7 +100,7 @@ class Policy(nn.Module):
                 values.append(self.value_head(features).item())
                 log_probs.append(log_prob.item())
                 old_means.append(mean.squeeze(0).cpu().numpy())
-                old_log_stds.append(log_std.squeeze(0).cpu().numpy())
+                old_log_stds.append(log_std.squeeze(0).detach().cpu().numpy())
                 
                 next_state, reward, terminated, truncated, _ = env.step(action.squeeze(0).cpu().numpy())
                 done = terminated or truncated
