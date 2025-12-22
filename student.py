@@ -22,16 +22,15 @@ class Policy(nn.Module):
 
         # Heads
         self.policy_mean = nn.Linear(512, 3)  # steer, gas, brake
-        self.log_std = nn.Parameter(torch.zeros(3) - 0.3)  # std ≈ 0.74
+        self.log_std = nn.Parameter(torch.zeros(3))  # std = 1.0 initially
         self.value_head = nn.Linear(512, 1)
 
         # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.95
-        self.delta = 0.01       # keep standard boundD
-        self.damping = 0.15     # more stable FVP
-        self.entropy_coef = 0.01
-        self.value_lr = 1e-3    # <-- add this
+        self.delta = 0.02       # larger steps early on
+        self.damping = 0.1      # lighter damping
+        self.value_lr = 1e-3
 
         self.to(self.device)
 
@@ -69,7 +68,7 @@ class Policy(nn.Module):
 
         num_iterations = 300
         steps_per_iter = 4096
-        value_epochs = 5
+        value_epochs = 10
         best_reward = -float('inf')
         
         for iteration in range(num_iterations):
@@ -87,23 +86,24 @@ class Policy(nn.Module):
                     mean = self.policy_mean(features)
                     log_std = self.log_std.expand_as(mean)
                     std = torch.exp(log_std)
-                    action = mean + std * torch.randn_like(mean)
-                    # clip to env bounds
-                    action = torch.stack([
-                        action[..., 0].clamp(-1, 1),
-                        action[..., 1].clamp(0, 1),
-                        action[..., 2].clamp(0, 1),
+                    noise = torch.randn_like(mean)
+                    action_raw = mean + std * noise  # unclipped for log_prob
+                    log_prob = self._gaussian_log_prob(action_raw, mean, log_std)
+                    # clip for env
+                    action_clipped = torch.stack([
+                        action_raw[..., 0].clamp(-1, 1),
+                        action_raw[..., 1].clamp(0, 1),
+                        action_raw[..., 2].clamp(0, 1),
                     ], dim=-1)
-                    log_prob = self._gaussian_log_prob(action, mean, log_std)
 
-                actions.append(action.squeeze(0).cpu().numpy())
+                actions.append(action_raw.squeeze(0).cpu().numpy())  # store raw for log_prob consistency
                 states.append(state)
                 values.append(self.value_head(features).item())
                 log_probs.append(log_prob.item())
                 old_means.append(mean.squeeze(0).cpu().numpy())
                 old_log_stds.append(log_std.squeeze(0).detach().cpu().numpy())
                 
-                action_np = action.squeeze(0).cpu().numpy().astype(np.float32)
+                action_np = action_clipped.squeeze(0).cpu().numpy().astype(np.float32)
                 next_state, reward, terminated, truncated, _ = env.step(action_np)
                 done = terminated or truncated
                 rewards.append(reward)
@@ -179,8 +179,7 @@ class Policy(nn.Module):
         log_std = self.log_std.expand_as(mean)
         log_probs = self._gaussian_log_prob(actions, mean, log_std)
         ratio = torch.exp(log_probs - old_log_probs)
-        entropy = 0.5 * (torch.log(2 * np.pi * torch.exp(2 * log_std)) + 1).sum(dim=-1).mean()
-        surrogate = (ratio * advantages).mean() + self.entropy_coef * entropy
+        surrogate = (ratio * advantages).mean()
         
         grads = torch.autograd.grad(surrogate, policy_params, retain_graph=True)
         flat_grad = torch.cat([g.reshape(-1) for g in grads])
