@@ -294,7 +294,8 @@ class Policy(nn.Module):
             state_tensor = states.to(self.device)
         else:
             state_tensor = torch.FloatTensor(states).to(self.device)
-        features = self.forward(state_tensor)
+        # use actor_forward (not forward which is a no-op)
+        features = self.actor_forward(state_tensor)
         logits = self.policy_head(features)
         return F.softmax(logits, dim=-1)
     
