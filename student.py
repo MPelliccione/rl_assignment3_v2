@@ -28,8 +28,8 @@ class Policy(nn.Module):
         # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.95
-        self.delta = 0.005      # tighter KL bound
-        self.damping = 0.10     # lighter damping
+        self.delta = 0.01       # loosen KL a bit for larger steps
+        self.damping = 0.10
         self.value_lr = 1e-3
 
         self.to(self.device)
