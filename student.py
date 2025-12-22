@@ -28,9 +28,10 @@ class Policy(nn.Module):
         # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.95
-        self.delta = 0.01       # loosen KL a bit for larger steps
-        self.damping = 0.10
+        self.delta = 0.005       # tighter KL bound
+        self.damping = 0.15      # more damping for FVP stability
         self.value_lr = 1e-3
+        self.entropy_coef = 0.01
 
         self.to(self.device)
 
@@ -66,10 +67,9 @@ class Policy(nn.Module):
         value_optimizer = torch.optim.Adam(self.value_head.parameters(), lr=self.value_lr)
         env = gym.make('CarRacing-v2', continuous=True)
 
-        # Main training loop
         num_iterations = 300
-        steps_per_iter = 4096    
-        value_epochs = 10        # fewer value epochs
+        steps_per_iter = 4096      # use 4096 if you need it faster
+        value_epochs = 5           # fewer critic epochs
         best_reward = -float('inf')
         
         for iteration in range(num_iterations):
@@ -103,7 +103,8 @@ class Policy(nn.Module):
                 old_means.append(mean.squeeze(0).cpu().numpy())
                 old_log_stds.append(log_std.squeeze(0).detach().cpu().numpy())
                 
-                next_state, reward, terminated, truncated, _ = env.step(action.squeeze(0).cpu().numpy())
+                action_np = action.squeeze(0).cpu().numpy().astype(np.float32)
+                next_state, reward, terminated, truncated, _ = env.step(action_np)
                 done = terminated or truncated
                 rewards.append(reward)
                 dones.append(done)
@@ -178,7 +179,8 @@ class Policy(nn.Module):
         log_std = self.log_std.expand_as(mean)
         log_probs = self._gaussian_log_prob(actions, mean, log_std)
         ratio = torch.exp(log_probs - old_log_probs)
-        surrogate = (ratio * advantages).mean()
+        entropy = 0.5 * (torch.log(2 * np.pi * torch.exp(2 * log_std)) + 1).sum(dim=-1).mean()
+        surrogate = (ratio * advantages).mean() + self.entropy_coef * entropy
         
         grads = torch.autograd.grad(surrogate, policy_params, retain_graph=True)
         flat_grad = torch.cat([g.reshape(-1) for g in grads])
