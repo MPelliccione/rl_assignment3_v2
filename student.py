@@ -28,7 +28,7 @@ class Policy(nn.Module):
         # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.95
-        self.delta = 0.005       # larger steps early on
+        self.delta = 0.01       # larger steps early on
         self.damping = 0.1      # lighter damping
         self.value_lr = 1e-3
 
