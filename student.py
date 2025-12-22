@@ -61,14 +61,17 @@ class Policy(nn.Module):
         return action
 
     def _get_policy_params(self):
-        """Get all parameters that affect the policy (CNN + policy head)"""
-        return list(self.conv1.parameters()) + list(self.conv2.parameters()) + \
-               list(self.conv3.parameters()) + list(self.fc1.parameters()) + \
-               list(self.policy_head.parameters())
+        """Update only policy head during TRPO (freeze shared CNN for trust region)"""
+        return list(self.policy_head.parameters())
 
     def train(self):
-        # Separate optimizer for value function only
-        value_optimizer = torch.optim.Adam(self.value_head.parameters(), lr=self.value_lr)
+        # Value optimizer updates CNN + value head (critic learns features)
+        value_optimizer = torch.optim.Adam(
+            list(self.conv1.parameters()) + list(self.conv2.parameters()) +
+            list(self.conv3.parameters()) + list(self.fc1.parameters()) +
+            list(self.value_head.parameters()),
+            lr=self.value_lr
+        )
         
         env = gym.make('CarRacing-v2', continuous=False)
         
