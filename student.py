@@ -272,3 +272,16 @@ class Policy(nn.Module):
             p = r + (new_rdotr / (rdotr + 1e-8)) * p
             rdotr = new_rdotr
         return x
+
+    def _gaussian_log_prob(self, action, mean, log_std):
+        var = torch.exp(2 * log_std)
+        return -0.5 * (((action - mean) ** 2) / (var + 1e-8) + 2 * log_std + np.log(2 * np.pi)).sum(-1)
+
+    def _compute_kl(self, old_mean, old_log_std, new_mean, new_log_std):
+        old_var = torch.exp(2 * old_log_std)
+        new_var = torch.exp(2 * new_log_std)
+        return 0.5 * (
+            ((old_var + (old_mean - new_mean) ** 2) / (new_var + 1e-8)).sum(-1)
+            + 2 * (new_log_std - old_log_std).sum(-1)
+            - old_mean.size(-1)
+        ).mean()
