@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 
 class Policy(nn.Module):
-    continuous = True
+    continuous = False
 
     def __init__(self, device=torch.device('cpu')):
         super(Policy, self).__init__()
@@ -21,15 +21,14 @@ class Policy(nn.Module):
         self.fc1 = nn.Linear(64 * 8 * 8, 512)
 
         # Heads
-        self.policy_mean = nn.Linear(512, 3)  # steer, gas, brake
-        self.log_std = nn.Parameter(torch.zeros(3))  # std = 1.0 initially
+        self.policy_head = nn.Linear(512, 5)  # discrete actions
         self.value_head = nn.Linear(512, 1)
 
         # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.95
-        self.delta = 0.01       # larger steps early on
-        self.damping = 0.1      # lighter damping
+        self.max_kl = 0.01
+        self.damping = 0.15
         self.value_lr = 1e-3
 
         self.to(self.device)
@@ -50,30 +49,26 @@ class Policy(nn.Module):
     
     def act(self, state):
         with torch.no_grad():
-            feats = self.forward(torch.FloatTensor(state).to(self.device))
-            mean = self.policy_mean(feats)
-            std = torch.exp(self.log_std)
-            action = mean + std * torch.randn_like(mean)
-            action = torch.stack([
-                action[..., 0].clamp(-1, 1),  # steer
-                action[..., 1].clamp(0, 1),   # gas
-                action[..., 2].clamp(0, 1),   # brake
-            ], dim=-1).squeeze(0)
-        return action.cpu().numpy()
+            state = torch.FloatTensor(state).to(self.device)
+            features = self.forward(state)
+            logits = self.policy_head(features)
+            probs = F.softmax(logits, dim=-1)
+            action = torch.multinomial(probs, 1).item()
+        return action
 
     # === Main training loop ===
     def train(self):
         value_optimizer = torch.optim.Adam(self.value_head.parameters(), lr=self.value_lr)
-        env = gym.make('CarRacing-v2', continuous=True)
+        env = gym.make('CarRacing-v2', continuous=False)
 
         num_iterations = 300
         steps_per_iter = 4096
-        value_epochs = 10
+        value_epochs = 20
         best_reward = -float('inf')
         
         for iteration in range(num_iterations):
             states, actions, rewards, dones, values, log_probs = [], [], [], [], [], []
-            old_means, old_log_stds = [], []
+            old_probs = []
             state, _ = env.reset()
             episode_reward = 0
             episode_rewards = []
@@ -83,28 +78,19 @@ class Policy(nn.Module):
                 with torch.no_grad():
                     state_tensor = torch.FloatTensor(state).to(self.device)
                     features = self.forward(state_tensor)
-                    mean = self.policy_mean(features)
-                    log_std = self.log_std.expand_as(mean)
-                    std = torch.exp(log_std)
-                    noise = torch.randn_like(mean)
-                    action_raw = mean + std * noise  # unclipped for log_prob
-                    log_prob = self._gaussian_log_prob(action_raw, mean, log_std)
-                    # clip for env
-                    action_clipped = torch.stack([
-                        action_raw[..., 0].clamp(-1, 1),
-                        action_raw[..., 1].clamp(0, 1),
-                        action_raw[..., 2].clamp(0, 1),
-                    ], dim=-1)
-
-                actions.append(action_raw.squeeze(0).cpu().numpy())  # store raw for log_prob consistency
-                states.append(state)
-                values.append(self.value_head(features).item())
-                log_probs.append(log_prob.item())
-                old_means.append(mean.squeeze(0).cpu().numpy())
-                old_log_stds.append(log_std.squeeze(0).detach().cpu().numpy())
+                    logits = self.policy_head(features)
+                    value = self.value_head(features)
+                    probs = F.softmax(logits, dim=-1)
+                    action = torch.multinomial(probs, 1).squeeze()
+                    log_prob = torch.log(probs.squeeze()[action] + 1e-8)
                 
-                action_np = action_clipped.squeeze(0).cpu().numpy().astype(np.float32)
-                next_state, reward, terminated, truncated, _ = env.step(action_np)
+                states.append(state)
+                actions.append(action.item())
+                values.append(value.item())
+                log_probs.append(log_prob.item())
+                old_probs.append(probs.squeeze(0).cpu().numpy())
+                
+                next_state, reward, terminated, truncated, _ = env.step(action.item())
                 done = terminated or truncated
                 rewards.append(reward)
                 dones.append(done)
@@ -123,16 +109,15 @@ class Policy(nn.Module):
             # Advantages / returns
             advantages, returns = self._compute_gae(rewards, values, dones)
             states_t = torch.FloatTensor(np.array(states)).to(self.device)
-            actions_t = torch.FloatTensor(np.array(actions)).to(self.device)
+            actions_t = torch.LongTensor(actions).to(self.device)
             advantages_t = torch.FloatTensor(advantages).to(self.device)
             returns_t = torch.FloatTensor(returns).to(self.device)
             old_log_probs_t = torch.FloatTensor(log_probs).to(self.device)
-            old_means_t = torch.FloatTensor(np.array(old_means)).to(self.device)
-            old_log_stds_t = torch.FloatTensor(np.array(old_log_stds)).to(self.device)
+            old_probs_t = torch.FloatTensor(np.array(old_probs)).to(self.device)
             advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
             
             # Policy update (TRPO)
-            self._trpo_update(states_t, actions_t, advantages_t, old_log_probs_t, old_means_t, old_log_stds_t)
+            self._trpo_update(states_t, actions_t, advantages_t, old_log_probs_t, old_probs_t)
             
             # Value function update
             for _ in range(value_epochs):
@@ -172,18 +157,23 @@ class Policy(nn.Module):
         return advantages, returns
 
     # === KL and policy update ===
-    def _trpo_update(self, states, actions, advantages, old_log_probs, old_means, old_log_stds):
+    def _compute_kl(self, old_probs, new_probs):
+        old_probs = torch.clamp(old_probs.detach(), 1e-8, 1.0)
+        new_probs = torch.clamp(new_probs, 1e-8, 1.0)
+        return (old_probs * (torch.log(old_probs) - torch.log(new_probs))).sum(dim=-1).mean()
+
+    def _trpo_update(self, states, actions, advantages, old_log_probs, old_probs):
         policy_params = self._get_policy_params()
         features = self.forward(states)
-        mean = self.policy_mean(features)
-        log_std = self.log_std.expand_as(mean)
-        log_probs = self._gaussian_log_prob(actions, mean, log_std)
+        logits = self.policy_head(features)
+        probs = F.softmax(logits, dim=-1)
+        log_probs = torch.log(probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)
         ratio = torch.exp(log_probs - old_log_probs)
         surrogate = (ratio * advantages).mean()
         
         grads = torch.autograd.grad(surrogate, policy_params, retain_graph=True)
         flat_grad = torch.cat([g.reshape(-1) for g in grads])
-        kl = self._compute_kl(old_means, old_log_stds, mean, log_std)
+        kl = self._compute_kl(old_probs, probs)
         
         def fvp(v):
             kl_grad = torch.autograd.grad(kl, policy_params, create_graph=True, retain_graph=True)
@@ -196,29 +186,27 @@ class Policy(nn.Module):
         shs = torch.dot(step_dir, fvp(step_dir))
         if shs <= 0:
             return
-        step_scale = torch.sqrt(2 * self.delta / (shs + 1e-8))
+        step_scale = torch.sqrt(2 * self.max_kl / (shs + 1e-8))
         full_step = step_dir * step_scale
 
         old_params = self._flat_params(policy_params).detach().clone()
         old_surrogate = surrogate.item()
         self._line_search(states, actions, advantages, old_log_probs,
-                          full_step, policy_params, old_params, old_means, old_log_stds, old_surrogate)
+                          full_step, policy_params, old_params, old_probs, old_surrogate)
 
     def _line_search(self, states, actions, advantages, old_log_probs,
-                     full_step, params, old_params, old_means, old_log_stds, old_surrogate, max_backtracks=10):
+                     full_step, params, old_params, old_probs, old_surrogate, max_backtracks=10):
         self._set_flat_params(params, old_params)
         for step_frac in [0.5 ** i for i in range(max_backtracks)]:
             new_params = old_params + step_frac * full_step
             self._set_flat_params(params, new_params)
             with torch.no_grad():
-                features = self.forward(states)
-                mean = self.policy_mean(features)
-                log_std = self.log_std.expand_as(mean)
-                new_log_probs = self._gaussian_log_prob(actions, mean, log_std)
+                new_probs = self.get_policy(states)
+                new_log_probs = torch.log(new_probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)
                 ratio = torch.exp(new_log_probs - old_log_probs)
                 new_surrogate = (ratio * advantages).mean().item()
-                kl = self._compute_kl(old_means, old_log_stds, mean, log_std).item()
-            if kl < self.delta and new_surrogate > old_surrogate:
+                kl = self._compute_kl(old_probs, new_probs).item()
+            if kl < self.max_kl and new_surrogate > old_surrogate:
                 return
         self._set_flat_params(params, old_params)
 
@@ -226,7 +214,7 @@ class Policy(nn.Module):
     def _get_policy_params(self):
         return list(self.conv1.parameters()) + list(self.conv2.parameters()) + \
                list(self.conv3.parameters()) + list(self.fc1.parameters()) + \
-               list(self.policy_mean.parameters()) + [self.log_std]
+               list(self.policy_head.parameters())
 
     def save(self):
         torch.save(self.state_dict(), 'model.pt')
@@ -254,9 +242,8 @@ class Policy(nn.Module):
         state_tensor = states.to(self.device) if isinstance(states, torch.Tensor) \
                        else torch.FloatTensor(states).to(self.device)
         features = self.forward(state_tensor)
-        mean = self.policy_mean(features)
-        log_std = self.log_std.expand_as(mean)
-        return mean, log_std
+        logits = self.policy_head(features)
+        return F.softmax(logits, dim=-1)
     
     def _conjugate_gradient(self, fvp, b, iters=10, tol=1e-10):
         x = torch.zeros_like(b)
@@ -275,15 +262,3 @@ class Policy(nn.Module):
             rdotr = new_rdotr
         return x
 
-    def _gaussian_log_prob(self, action, mean, log_std):
-        var = torch.exp(2 * log_std)
-        return -0.5 * (((action - mean) ** 2) / (var + 1e-8) + 2 * log_std + np.log(2 * np.pi)).sum(-1)
-
-    def _compute_kl(self, old_mean, old_log_std, new_mean, new_log_std):
-        old_var = torch.exp(2 * old_log_std)
-        new_var = torch.exp(2 * new_log_std)
-        return 0.5 * (
-            ((old_var + (old_mean - new_mean) ** 2) / (new_var + 1e-8)).sum(-1)
-            + 2 * (new_log_std - old_log_std).sum(-1)
-            - old_mean.size(-1)
-        ).mean()
