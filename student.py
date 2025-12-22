@@ -28,10 +28,9 @@ class Policy(nn.Module):
         # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.95
-        self.delta = 0.01        # larger KL bound for bigger step
-        self.damping = 0.10      # slightly lighter damping
-        self.value_lr = 1e-3
-        self.entropy_coef = 0.02 # more exploration
+        self.delta = 0.01       # keep standard bound
+        self.damping = 0.15     # more stable FVP
+        self.entropy_coef = 0.01
 
         self.to(self.device)
 
@@ -68,8 +67,8 @@ class Policy(nn.Module):
         env = gym.make('CarRacing-v2', continuous=True)
 
         num_iterations = 300
-        steps_per_iter = 4096      # use 4096 if you need it faster
-        value_epochs = 5           # fewer critic epochs
+        steps_per_iter = 8192   # larger batch for lower variance
+        value_epochs = 5
         best_reward = -float('inf')
         
         for iteration in range(num_iterations):
