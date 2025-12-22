@@ -22,16 +22,16 @@ class Policy(nn.Module):
 
         # Heads
         self.policy_mean = nn.Linear(512, 3)  # steer, gas, brake
-        self.log_std = nn.Parameter(torch.zeros(3) - 0.5)  # smaller initial std
+        self.log_std = nn.Parameter(torch.zeros(3) - 0.3)  # std ≈ 0.74
         self.value_head = nn.Linear(512, 1)
 
         # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.95
-        self.delta = 0.005       # tighter KL bound
-        self.damping = 0.15      # more damping for FVP stability
+        self.delta = 0.01        # larger KL bound for bigger step
+        self.damping = 0.10      # slightly lighter damping
         self.value_lr = 1e-3
-        self.entropy_coef = 0.01
+        self.entropy_coef = 0.02 # more exploration
 
         self.to(self.device)
 
