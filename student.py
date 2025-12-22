@@ -68,7 +68,7 @@ class Policy(nn.Module):
         env = gym.make('CarRacing-v2', continuous=True)
 
         num_iterations = 300
-        steps_per_iter = 8192   # larger batch for lower variance
+        steps_per_iter = 4096
         value_epochs = 5
         best_reward = -float('inf')
         
