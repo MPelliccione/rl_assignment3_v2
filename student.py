@@ -28,9 +28,10 @@ class Policy(nn.Module):
         # TRPO hyperparameters
         self.gamma = 0.99
         self.lam = 0.95
-        self.delta = 0.01       # keep standard bound
+        self.delta = 0.01       # keep standard boundD
         self.damping = 0.15     # more stable FVP
         self.entropy_coef = 0.01
+        self.value_lr = 1e-3    # <-- add this
 
         self.to(self.device)
 
