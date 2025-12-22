@@ -68,7 +68,7 @@ class Policy(nn.Module):
 
         # Main training loop
         num_iterations = 300
-        steps_per_iter = 8192    # larger batch to reduce variance
+        steps_per_iter = 4096    
         value_epochs = 10        # fewer value epochs
         best_reward = -float('inf')
         
