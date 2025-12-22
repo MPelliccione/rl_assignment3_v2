@@ -199,19 +199,17 @@ class Policy(nn.Module):
     def _trpo_update(self, states, actions, advantages, old_log_probs, old_probs):
         policy_params = self._get_policy_params()
         
-        features = self.forward(states)
+        features = self.forward(states)  # Pre-compute features once (CNN frozen)
         logits = self.policy_head(features)
         probs = F.softmax(logits, dim=-1)
         log_probs = torch.log(probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)
         
         ratio = torch.exp(log_probs - old_log_probs)
-        surrogate = (ratio * advantages).mean()  # We want to MAXIMIZE this
+        surrogate = (ratio * advantages).mean()
         
-        # Gradient of surrogate (we want to ascend)
         grads = torch.autograd.grad(surrogate, policy_params, retain_graph=True)
         flat_grad = torch.cat([g.reshape(-1) for g in grads])
         
-        # Use the rollout (frozen) policy for KL
         kl = self._compute_kl(old_probs, probs)
         
         def fvp(v):
@@ -231,26 +229,25 @@ class Policy(nn.Module):
         
         old_params = self._flat_params(policy_params).detach().clone()
         old_surrogate = surrogate.item()
-        self._line_search(states, actions, advantages, old_log_probs,
+        self._line_search(features, actions, advantages, old_log_probs,  # Pass features
                           full_step, policy_params, old_params, old_probs, old_surrogate)
 
-    def _line_search(self, states, actions, advantages, old_log_probs,
+    def _line_search(self, features, actions, advantages, old_log_probs,  # Accept features
                      full_step, params, old_params, old_probs, old_surrogate, max_backtracks=10):
-        # Start from old params
         self._set_flat_params(params, old_params)
         for step_frac in [0.5 ** i for i in range(max_backtracks)]:
             new_params = old_params + step_frac * full_step
             self._set_flat_params(params, new_params)
             with torch.no_grad():
-                new_probs = self.get_policy(states)
-                new_log_probs = torch.log(new_probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)  # keep batch dim
+                # Use pre-computed features instead of re-running forward
+                logits = self.policy_head(features)
+                new_probs = F.softmax(logits, dim=-1)
+                new_log_probs = torch.log(new_probs.gather(1, actions.unsqueeze(1)).squeeze(1) + 1e-8)
                 ratio = torch.exp(new_log_probs - old_log_probs)
-                new_surrogate = (ratio * advantages).mean().item()  # Maximize this
+                new_surrogate = (ratio * advantages).mean().item()
                 kl = self._compute_kl(old_probs, new_probs).item()
-            # Accept if KL constraint satisfied AND surrogate improved
             if kl < self.max_kl and new_surrogate > old_surrogate:
-                return  # accept
-        # reject step
+                return
         self._set_flat_params(params, old_params)
 
     def save(self):
