@@ -103,7 +103,8 @@ class Policy(nn.Module):
                 old_means.append(mean.squeeze(0).cpu().numpy())
                 old_log_stds.append(log_std.squeeze(0).detach().cpu().numpy())
                 
-                next_state, reward, terminated, truncated, _ = env.step(action.squeeze(0).cpu().numpy())
+                action_np = action.squeeze(0).cpu().numpy().astype(np.float32)
+                next_state, reward, terminated, truncated, _ = env.step(action_np)
                 done = terminated or truncated
                 rewards.append(reward)
                 dones.append(done)
