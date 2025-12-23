@@ -31,8 +31,8 @@ class Policy(nn.Module):
         # Hyperparameters for TRPO
         self.gamma = 0.99  # Discount factor
         self.lam = 0.95    # Lambda for GAE
-        self.delta = 0.01  # KL divergence limit
-        self.damping = 0.15  # Damping for conjugate gradient
+        self.delta = 0.005  # KL divergence limit
+        self.damping = 0.1  # Damping for conjugate gradient
         self.value_lr = 1e-3  # Learning
 
         # Move model to device
