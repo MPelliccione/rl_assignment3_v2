@@ -39,7 +39,6 @@ class Policy(nn.Module):
         self.to(self.device)
 
     def actor_forward(self, x):
-        # Process input for actor: add batch dim if needed, permute channels, normalize
         if x.dim() == 3:
             x = x.unsqueeze(0)
         if x.shape[-1] == 3:
@@ -247,7 +246,24 @@ class Policy(nn.Module):
         old_surrogate = surrogate.item()
         self._line_search(actor_features, actions, advantages, old_log_probs,
                           full_step, policy_params, old_params, old_probs, old_surrogate)
-
+    
+    def _conjugate_gradient(self, fvp, b, iters=10, tol=1e-10):
+            x = torch.zeros_like(b)
+            r = b.clone()
+            p = b.clone()
+            rdotr = torch.dot(r, r)
+            for _ in range(iters):
+                Ap = fvp(p)
+                alpha = rdotr / (torch.dot(p, Ap) + 1e-8)
+                x += alpha * p
+                r -= alpha * Ap
+                new_rdotr = torch.dot(r, r)
+                if new_rdotr < tol:
+                    break
+                p = r + (new_rdotr / (rdotr + 1e-8)) * p
+                rdotr = new_rdotr
+            return x
+    
     def _line_search(self, actor_features, actions, advantages, old_log_probs,
                      full_step, params, old_params, old_probs, old_surrogate, max_backtracks=10):
         # Line search to ensure improvement and KL constraint
@@ -275,23 +291,6 @@ class Policy(nn.Module):
         features = self.actor_forward(state_tensor)
         logits = self.policy_head(features)
         return F.softmax(logits, dim=-1)
-
-    def _conjugate_gradient(self, fvp, b, iters=10, tol=1e-10):
-        x = torch.zeros_like(b)
-        r = b.clone()
-        p = b.clone()
-        rdotr = torch.dot(r, r)
-        for _ in range(iters):
-            Ap = fvp(p)
-            alpha = rdotr / (torch.dot(p, Ap) + 1e-8)
-            x += alpha * p
-            r -= alpha * Ap
-            new_rdotr = torch.dot(r, r)
-            if new_rdotr < tol:
-                break
-            p = r + (new_rdotr / (rdotr + 1e-8)) * p
-            rdotr = new_rdotr
-        return x
 
     def save(self):
         torch.save(self.state_dict(), 'model.pt')
